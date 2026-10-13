@@ -2,51 +2,40 @@
 pragma solidity 0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
-import {VestingWallet} from "@openzeppelin/contracts/finance/VestingWallet.sol";
 import {ECU} from "../src/ECU.sol";
 import {FarmVault} from "../src/FarmVault.sol";
+import {Distributor} from "../src/Distributor.sol";
+import {TeamVesting} from "../src/TeamVesting.sol";
+import {CommunityVesting} from "../src/CommunityVesting.sol";
 
-/// @notice Deploys the token and the vault, then splits the supply exactly as §11.7 says.
+/// @notice The Sepolia dry run: deploys the token, the vault, both vesting wallets and the
+///         Distributor, then calls `distribute()` so the §11.7 split is visible on chain.
 ///
-/// @dev The table in ECONOMY.md §11.7 is the specification and this script is its only
-///      implementation, so the shares live here as constants and the sum is asserted
-///      rather than trusted:
+/// @dev The split itself lives in `Distributor`, not here: a script is an ephemeral
+///      contract, and the supply must never sit at an address that exists only in forge's
+///      simulation (AUDIT.md finding 1). This script therefore never reads `address(this)`.
+///      Everything it deploys comes from the broadcaster, and the only address it has to
+///      know ahead of time -- the token's, which the vault needs before the token exists --
+///      is derived from the broadcaster's nonce and asserted after the fact.
 ///
-///      | DEX liquidity | 15 % | the pool -- the only ECU anyone can buy at launch |
-///      | Community     | 15 % | vesting contract                                  |
-///      | Team          | 15 % | vesting contract, 3-year schedule                 |
-///      | Listings      |  5 % | multisig, held rather than liquidity              |
-///      | Co-op reserve | 35 % | the Vault                                         |
-///      | Bank pool     | 15 % | the Vault                                         |
+///      Every destination is read from the environment with no default, on purpose: a
+///      launch that silently fell back to the deployer would put a slice somewhere nobody
+///      chose. On the testnet dry run the owner wallet fills every one of them.
 ///
-///      The last two are one transfer, not two. §11.7 is explicit that the Vault is "a
-///      rollup, not a fourth balance": the reserve and the Bank pool are ledger accounts
-///      whose tokens sit together in custody, and splitting them on chain would invent a
-///      distinction the ledger is the authority on.
-///
-///      The LP slice goes to the deployer-nominated liquidity address rather than being
-///      paired here. Pairing means creating a Uniswap V4 pool with the fee hook of §11.6,
-///      whose parameters are immutable once set; doing that inside a distribution script
-///      would bury the most consequential decision of the launch in a loop of transfers.
+///      On mainnet the token is created by IMD's custom_token launch (15 % pool, 10 %
+///      swarm, 75 % to the Distributor as `remainderTo`), so only the vault, the vesting
+///      wallets and the Distributor are deployed there and the token step here is skipped.
 contract Distribute is Script {
-    uint256 internal constant TOTAL = 100_000_000e18;
-
-    uint256 internal constant LP_SHARE = 15;
-    uint256 internal constant COMMUNITY_SHARE = 15;
-    uint256 internal constant TEAM_SHARE = 15;
-    uint256 internal constant LISTINGS_SHARE = 5;
-    uint256 internal constant GAME_SHARE = 50; // 35 reserve + 15 Bank pool, one balance
-
-    /// @notice Three years, the schedule §11.7 gives the team slice.
-    uint64 internal constant TEAM_VESTING_SECONDS = 3 * 365 days;
-    /// @notice The community slice vests too, over one year unless overridden.
-    uint64 internal constant COMMUNITY_VESTING_SECONDS = 365 days;
+    /// @notice Initial cap on ECU leaving the vault in one 24-hour window: roughly 7.5x
+    ///         the §3.3 Exchange budget at launch, and a week of it stays under gate 6.
+    uint256 public constant INITIAL_MAX_OUTFLOW_PER_WINDOW = 250_000e18;
+    /// @notice Initial cap on a single voucher.
+    uint256 public constant INITIAL_MAX_VOUCHER_AMOUNT = 50_000e18;
 
     struct Destinations {
-        address liquidity;
         address communityBeneficiary;
         address teamBeneficiary;
-        address listingsMultisig;
+        address listings;
         address operator;
         address guardian;
     }
@@ -54,61 +43,68 @@ contract Distribute is Script {
     struct Deployment {
         ECU ecu;
         FarmVault vault;
-        VestingWallet communityVesting;
-        VestingWallet teamVesting;
+        TeamVesting teamVesting;
+        CommunityVesting communityVesting;
+        Distributor distributor;
     }
 
     function run() external returns (Deployment memory deployment) {
         Destinations memory to = Destinations({
-            liquidity: vm.envAddress("LIQUIDITY_ADDRESS"),
             communityBeneficiary: vm.envAddress("COMMUNITY_BENEFICIARY"),
             teamBeneficiary: vm.envAddress("TEAM_BENEFICIARY"),
-            listingsMultisig: vm.envAddress("LISTINGS_MULTISIG"),
+            listings: vm.envAddress("LISTINGS_MULTISIG"),
             operator: vm.envAddress("VAULT_OPERATOR"),
             guardian: vm.envAddress("VAULT_GUARDIAN")
         });
 
         vm.startBroadcast();
-        deployment = deployAll(to, uint64(block.timestamp));
+        (, address deployer,) = vm.readCallers();
+        deployment = deployAll(to, uint64(block.timestamp), deployer);
+        deployment.distributor.distribute();
         vm.stopBroadcast();
 
         _report(deployment, to);
     }
 
-    /// @dev Split out, and public, so the tests exercise the real distribution rather than
-    ///      a reimplementation of it that could drift from what actually gets broadcast.
-    function deployAll(Destinations memory to, uint64 startAt) public returns (Deployment memory deployment) {
-        require(LP_SHARE + COMMUNITY_SHARE + TEAM_SHARE + LISTINGS_SHARE + GAME_SHARE == 100, "shares must sum to 100");
+    /// @dev Split out, and public, so the tests exercise the real deployment rather than a
+    ///      reimplementation of it that could drift from what actually gets broadcast.
+    ///      `deployer` is whoever the five creations below come from; its nonce fixes the
+    ///      token's address before the token exists, which is what lets the vault take it
+    ///      as an immutable and the token mint to the Distributor that targets the vault.
+    function deployAll(Destinations memory to, uint64 startAt, address deployer)
+        public
+        returns (Deployment memory deployment)
+    {
+        uint64 nonce = vm.getNonce(deployer);
+        address predictedEcu = vm.computeCreateAddress(deployer, nonce + 4);
 
-        // The deployer holds the supply for the length of this script and nothing longer.
-        deployment.ecu = new ECU(address(this));
-        deployment.vault = new FarmVault(deployment.ecu, to.operator, to.guardian);
+        deployment.teamVesting = new TeamVesting(to.teamBeneficiary, startAt); // nonce
+        deployment.communityVesting = new CommunityVesting(to.communityBeneficiary, startAt); // nonce + 1
+        deployment.vault = new FarmVault( // nonce + 2
+            ECU(predictedEcu),
+            to.operator,
+            to.guardian,
+            INITIAL_MAX_OUTFLOW_PER_WINDOW,
+            INITIAL_MAX_VOUCHER_AMOUNT
+        );
+        deployment.distributor = new Distributor( // nonce + 3
+            address(deployment.vault),
+            address(deployment.teamVesting),
+            address(deployment.communityVesting),
+            to.listings
+        );
+        deployment.ecu = new ECU(address(deployment.distributor)); // nonce + 4
 
-        deployment.communityVesting = new VestingWallet(to.communityBeneficiary, startAt, COMMUNITY_VESTING_SECONDS);
-        deployment.teamVesting = new VestingWallet(to.teamBeneficiary, startAt, TEAM_VESTING_SECONDS);
-
-        deployment.ecu.transfer(to.liquidity, _slice(LP_SHARE));
-        deployment.ecu.transfer(address(deployment.communityVesting), _slice(COMMUNITY_SHARE));
-        deployment.ecu.transfer(address(deployment.teamVesting), _slice(TEAM_SHARE));
-        deployment.ecu.transfer(to.listingsMultisig, _slice(LISTINGS_SHARE));
-        deployment.ecu.transfer(address(deployment.vault), _slice(GAME_SHARE));
-
-        // Nothing may be left behind: a remainder in the deployer is supply nobody
-        // accounted for, and the 100 M invariant the whole ledger rests on would be a
-        // statement about a balance that is not where the spec says it is.
-        require(deployment.ecu.balanceOf(address(this)) == 0, "undistributed remainder");
-    }
-
-    function _slice(uint256 share) internal pure returns (uint256) {
-        return (TOTAL * share) / 100;
+        require(address(deployment.ecu) == predictedEcu, "token address prediction failed");
+        require(address(deployment.vault.ecu()) == address(deployment.ecu), "vault not wired to token");
     }
 
     function _report(Deployment memory d, Destinations memory to) internal pure {
         console.log("ECU                ", address(d.ecu));
         console.log("FarmVault          ", address(d.vault));
-        console.log("Community vesting  ", address(d.communityVesting));
+        console.log("Distributor        ", address(d.distributor));
         console.log("Team vesting       ", address(d.teamVesting));
-        console.log("Liquidity           ", to.liquidity);
-        console.log("Listings multisig   ", to.listingsMultisig);
+        console.log("Community vesting  ", address(d.communityVesting));
+        console.log("Listings           ", to.listings);
     }
 }

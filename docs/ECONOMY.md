@@ -470,7 +470,7 @@ Use as the base tuning; the economy above sits on top of these yields.
 
 | Param | Value | Notes |
 |---|---|---|
-| Supply | 100 M ECU | 35 % Co-op reserve, 15 % Bank pool, 15 % DEX LP (locked 2 y), 15 % community, 15 % team (3 y vest), 5 % listings |
+| Supply | 100 M ECU | 15 % DEX pool (factory-owned single-sided V4 position), 10 % swarm, 50 % vault (35 % Co-op reserve + 15 % Bank pool), 15 % team (12 m cliff / 36 m), 5 % community (12 m linear), 5 % listings |
 | `γ` (Co-op inventory exponent) | 0.6 | Black Market uses 2.0 |
 | `α` (reserve exponent) | 0.5 | |
 | Exchange budget (v1.0) | `B = R · ln2 / 730 + EMA30(coin-purchase ECU)`, rate ≤ 1.0 ECU/coin | §3.0b; replaces the 2 %-of-R Co-op payout budget |
@@ -628,12 +628,20 @@ day one, which is what determines what can move and what cannot.
 
 | Slice | Share | Where it sits | Liquid? |
 |---|---|---|---|
-| DEX liquidity | 15 % | The Uniswap V4 pool (§11.6) | Yes — this is the only ECU anyone can buy |
-| Community | 15 % | Vesting contract | No |
-| Team | 15 % | Vesting contract, 3-year schedule | No |
-| Listings | 5 % | Multisig | Held, not liquidity |
+| DEX pool | 15 % | The Uniswap V4 pool (§11.6), a single-sided position owned by the launch factory | Yes — this is the only ECU anyone can buy |
+| Swarm | 10 % | The launch's contributor allocation, paid out by the launch | Per the launch's own schedule |
 | Co-op reserve | 35 % | Vault contract, mirrored in the ledger | Game-side only |
 | Bank pool | 15 % | Vault contract, mirrored in the ledger | Game-side only |
+| Team | 15 % | `TeamVesting`: 36-month linear schedule, nothing before a 12-month cliff | No |
+| Community | 5 % | `CommunityVesting`: 12-month linear schedule, no cliff | No |
+| Listings | 5 % | Multisig | Held, not liquidity |
+
+The token is created by the launch, which places the pool and the swarm slices itself and
+sends the remaining 75 % to the `Distributor` contract. `distribute()` then splits that
+75 % in one transaction: 50/75 to the Vault, 15/75 to team vesting, 5/75 to community
+vesting and the remainder to listings, so no dust is stranded and no wallet ever holds the
+supply in between. There is no separate LP lock: the pool position is custodied by the
+factory, which replaces the two-year lock earlier drafts of this table specified.
 
 ### How the ledger models it
 
@@ -646,7 +654,8 @@ Three pots, all accounts under the 100 M invariant, and four flows between them:
     sell      wallet   -> pool_ecu        (1.5 % of the ECU burned)
 ```
 
-- `pool_ecu` — the ECU side of the pool. Opens at the 15 % LP allocation.
+- `pool_ecu` — the ECU side of the pool. Opens at the 15 % pool allocation, held as a
+  factory-owned single-sided V4 position.
 - `wallet` — ECU players hold on chain, between the pool and the Vault.
 - The **Vault is a rollup, not a fourth balance.** Every game-side token is already an
   account — the farm buckets, the reserve, the Bank pool, the escrows — so a `vault`
@@ -660,9 +669,12 @@ own row, which is what keeps it out of a sum that means "all the ECU there is".
 Two consequences worth stating plainly:
 
 - **The circulating float at launch is the 15 % in the pool.** Everything else is either
-  vesting, held, or game-side. A player who wants to bridge ECU in buys it there first,
-  which is why the simulator's vault stand-in is funded from the LP slice and not from
-  listings — listings is a multisig balance, not liquidity.
+  vesting, held, game-side, or the swarm's allocation on the launch's schedule. The team
+  slice releases nothing for twelve months and the community slice releases one 365th a
+  day, so day one adds about 685 ECU of community vesting to the float and no team tokens.
+  A player who wants to bridge ECU in buys it on the pool first, which is why the
+  simulator's vault stand-in is funded from the pool slice and not from listings —
+  listings is a multisig balance, not liquidity.
 - **The reserve and the Bank pool are custodied by the Vault contract but spent by the
   game.** The ledger is the authority on their balances; the contract is the authority on
   the tokens. The two are the same 50 % viewed from either side, and reconciling them is
