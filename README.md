@@ -1,10 +1,12 @@
 # e-Farm contracts
 
 Five contracts ship in phase 1: the **ECU** token, the **FarmVault** that custodies the
-game-side half of the supply, the one-shot **Distributor** that splits the launch
-allocation, and the **TeamVesting** and **CommunityVesting** wallets. Everything else the
-game does — farms, plots, animals, markets, the Bank — is off-chain, and `docs/ECONOMY.md`
-is the authority on it.
+game-side half of the supply, the **Distributor** that creates the other four and splits
+the launch allocation, and the **TeamVesting** and **CommunityVesting** wallets. One
+creation deploys all of them: the launch manifest lists only `Distributor`, whose
+constructor creates the token, the vault and both vesting wallets and performs the split
+in the same transaction. Everything else the game does — farms, plots, animals, markets,
+the Bank — is off-chain, and `docs/ECONOMY.md` is the authority on it.
 
 The guiding constraint, from ECONOMY.md §1: *the chain holds the token and the custody,
 the ledger holds the economy.* A contract here should be boring enough that an auditor can
@@ -15,11 +17,13 @@ read it in one sitting, because the interesting rules are all in the Python.
 ```
 src/ECU.sol                 fixed-supply ERC-20, no owner, no hooks
 src/FarmVault.sol           deposits in, operator-signed vouchers out, capped per voucher and per day
-src/Distributor.sol         one-shot split of whatever ECU it receives (§11.7)
+src/DistributorBase.sol     the launch root: creates vault + vesting (+ token), splits per §11.7
+src/Distributor.sol         the root in token-creating mode: the one contract the manifest lists
+src/TokenDistributor.sol    the root for an existing token (mainnet custom_token launch), deferred split
 src/TeamVesting.sol         OZ VestingWalletCliff: 36 months, 12-month cliff, renounce disabled
 src/CommunityVesting.sol    OZ VestingWallet: 12 months linear, renounce disabled
 src/interfaces/             phase-2 shapes only (plots ERC-721, animals ERC-1155)
-script/Distribute.s.sol     the Sepolia dry run: deploy everything, then distribute()
+script/Distribute.s.sol     the Sepolia dry run: new Distributor(...) and nothing else
 test/                       forge tests for all of the above
 ADAPTATION.md               what changed for the launch, and which audit finding required it
 ```
@@ -115,11 +119,23 @@ guardian can pause withdrawals indefinitely while deposits keep flowing.
 
 ### Distributor
 
-The launch allocation never passes through a wallet. On mainnet the token is created by
-IMD's custom_token launch, which places 15 % in a factory-owned single-sided Uniswap V4
-position and 10 % with the swarm, and sends the remaining 75 % to the `Distributor` as
-`remainderTo`. On the Sepolia dry run the token mints its whole supply to the Distributor.
-Either way, anyone then calls `distribute()` once and it splits whatever it holds:
+The launch allocation never passes through a wallet, and the launch never has to order
+anything: `ECU(distributor)` mints to the Distributor, `FarmVault(ecu, …)` fixes the token,
+and the Distributor fixes the vault — a cycle that separate transactions can only resolve
+by predicting nonces, which a bytecode manifest cannot do. So the Distributor is the
+**root**: its constructor creates the other contracts itself, in one transaction, and
+nothing is left to wire afterwards.
+
+`Distributor(operator, guardian, teamBeneficiary, communityBeneficiary, listings,
+maxOutflowPerWindow, maxVoucherAmount)` — token-creating mode, the one the manifest lists:
+
+1. `new ECU(address(this))` — the whole 100 M is minted to the Distributor;
+2. `new FarmVault(ecu, operator, guardian, maxOutflowPerWindow, maxVoucherAmount)`;
+3. `new TeamVesting(teamBeneficiary, block.timestamp)` (36 months, 12-month cliff) and
+   `new CommunityVesting(communityBeneficiary, block.timestamp)` (12 months), both with
+   `renounceOwnership` disabled;
+4. emits `Launched(token, vault, teamVesting, communityVesting, listings)`;
+5. splits the supply and emits `Distributed`; the Distributor ends with a zero balance.
 
 | Share of what arrives | Where |
 |---|---|
@@ -128,10 +144,25 @@ Either way, anyone then calls `distribute()` once and it splits whatever it hold
 | 5/75 | `CommunityVesting` |
 | the remainder (5/75 plus rounding dust) | listings |
 
-The four targets are immutable constructor arguments; the constructor makes no external
-call, and the token is read from the vault at distribution time, so the Distributor can
-be deployed before the vault has code. A second call reverts; a call before any ECU has
-arrived reverts without consuming the one shot.
+The created addresses are public immutables — `token()`, `vault()`, `teamVesting()`,
+`communityVesting()` — next to `listings()`. There is no owner and no `distribute()` call
+to make: in this mode `distribute()` reverts `AlreadyDistributed`. The constructor takes
+seven static arguments and calls no pre-existing contract, so the launch's empty-chain
+rehearsal runs it as is. Tokens sent to the Distributor *after* launch are unrecoverable
+(no owner, shot spent); it is not an address to send anything to.
+
+`TokenDistributor(token, expectedBalance, operator, guardian, teamBeneficiary,
+communityBeneficiary, listings, maxOutflowPerWindow, maxVoucherAmount)` — the second
+mode, for the mainnet custom_token launch, where IMD creates the token, places 15 % in the
+pool and 10 % with the swarm and sends the remaining 75 % to this contract as
+`remainderTo`. The constructor skips token creation, never calls the token (it may not
+exist yet), creates the vault against it and the two vesting wallets, and emits
+`Launched`. The split is deferred to a **permissionless one-shot `distribute()`** that
+refuses with `InsufficientBalance(held, expected)` until the contract holds at least
+`expectedBalance`, and then splits everything it holds (over-delivery included) by the
+same table. A refused call does not consume the shot. `expectedBalance` must equal what the
+launch will deliver — 75 % of the token's supply — because a larger value leaves
+`distribute()` refusing forever and a smaller one lets a partial delivery spend the shot.
 
 ### Vesting wallets
 
@@ -148,19 +179,35 @@ would strand the slice. In production both beneficiaries are Safes.
 
 ## Launch distribution and the Sepolia dry run
 
-`script/Distribute.s.sol` is the Sepolia dry run. Under `vm.startBroadcast()` it deploys,
-from the broadcaster, in this order: `TeamVesting`, `CommunityVesting`, `FarmVault`,
-`Distributor`, `ECU` (minted to the Distributor), and then calls `distribute()` so the
-split is visible on chain. The vault needs the token's address before the token exists,
-so the script derives it from the broadcaster's nonce and asserts the match after the
-fact; it never relies on `address(this)`.
+The deployment is one creation. The launch manifest lists `Distributor` with its seven
+constructor arguments; `script/Distribute.s.sol` does the same thing by hand for the
+Sepolia dry run — `run()` reads the five addresses from the environment and `deploy()`
+broadcasts `new Distributor(...)`. There is no ordering, no nonce prediction and no
+`distribute()` call; the script holds no supply and never reads `address(this)`.
 
-Every address is read from the environment with no default: `COMMUNITY_BENEFICIARY`,
-`TEAM_BENEFICIARY`, `LISTINGS_MULTISIG`, `VAULT_OPERATOR`, `VAULT_GUARDIAN`. For the
-testnet dry run the owner wallet fills all five. In production the two beneficiaries are
-Safes (the beneficiary is a transferable owner that must be a Safe, not an address that
-"cannot be changed"), the listings address and the guardian are multisigs, and the
-operator is the backend's EOA hot key.
+| Constructor argument | Dry run (Sepolia) | Mainnet |
+|---|---|---|
+| `operator` | the owner wallet | the backend's EOA hot key |
+| `guardian` | the owner wallet | a 2-of-3 Safe |
+| `teamBeneficiary` | the owner wallet | a Safe (transferable owner, never renounceable) |
+| `communityBeneficiary` | the owner wallet | a Safe |
+| `listings` | the owner wallet | the listings multisig |
+| `maxOutflowPerWindow` | 250 000 ECU (`INITIAL_MAX_OUTFLOW_PER_WINDOW`) | guardian may change after launch |
+| `maxVoucherAmount` | 50 000 ECU (`INITIAL_MAX_VOUCHER_AMOUNT`) | guardian may change after launch |
+
+The two caps are the values the brief left open; they are named constants in the script
+(the window cap is about 7.5× the §3.3 Exchange budget at launch and a week of it stays
+under gate 6 of §9) and the guardian can change both at any time with
+`setMaxOutflowPerWindow` / `setMaxVoucherAmount`. The vesting schedules start at the
+block timestamp of the launch transaction.
+
+The script reads every address from the environment with no default, on purpose:
+`VAULT_OPERATOR`, `VAULT_GUARDIAN`, `TEAM_BENEFICIARY`, `COMMUNITY_BENEFICIARY`,
+`LISTINGS_MULTISIG`. For the testnet dry run the owner wallet fills all five, so after
+the transaction the owner wallet holds the 5/75 listings slice directly and owns both
+vesting wallets, while the vault's keys are the owner wallet too. (`.env.example` still
+lists `LIQUIDITY_ADDRESS`, which nothing reads any more; it is outside this job's
+writable paths.)
 
 | Slice | Share | Where |
 |---|---|---|
@@ -171,9 +218,6 @@ operator is the backend's EOA hot key.
 | Community | 5 % | `CommunityVesting`, 12 months linear |
 | Listings | 5 % | multisig |
 
-The script does not create the pool: on mainnet the launch does, and the position is
-custodied by the factory in place of the two-year LP lock earlier drafts specified.
-
 ```bash
 export COMMUNITY_BENEFICIARY=0x… TEAM_BENEFICIARY=0x… LISTINGS_MULTISIG=0x… \
        VAULT_OPERATOR=0x… VAULT_GUARDIAN=0x…
@@ -181,10 +225,31 @@ forge script script/Distribute.s.sol:Distribute \
   --rpc-url $SEPOLIA_RPC_URL --broadcast --verify -vvvv
 ```
 
+Verification on the explorer covers the Distributor; the four contracts it created are
+verified separately by address (`forge verify-contract` with the constructor arguments
+printed by the script's `Launched` event or its log lines).
+
 Run it on Sepolia (11155111) first and let the backend run a full deposit → tick →
-voucher → withdraw cycle against it before mainnet is considered. On mainnet only the
-vault, the two vesting wallets and the Distributor are deployed; the token comes from the
-custom_token launch with the Distributor as `remainderTo`.
+voucher → withdraw cycle against it before mainnet is considered. On mainnet the token
+comes from the custom_token launch, and the root is `TokenDistributor` with that token as
+`token` and the launch's remainder (75 % of supply) as `expectedBalance`, deployed before
+the launch so its address can be given as `remainderTo`; after the launch has delivered,
+anyone calls `distribute()` once.
+
+### After launch: who does what
+
+- **Guardian** (the owner wallet on the dry run, a Safe on mainnet): can pause and unpause
+  withdrawals, rotate the operator (`setOperator`, which invalidates every outstanding
+  voucher), raise or lower both caps, nominate a successor (`setGuardian` +
+  `acceptGuardian` from the nominee) and bump a recipient's nonce. The guardian has
+  custody up to the caps: a guardian hand-over is a custody hand-over.
+- **Operator** (the backend's hot key): signs `WithdrawalVoucher`s including the current
+  `operatorEpoch`; may bump a recipient's nonce. Must be an EOA.
+- **Vesting beneficiaries**: call `release(token)` on their wallet when they want vested
+  ECU; may `transferOwnership` to a new Safe; cannot renounce.
+- **Listings multisig**: holds the 5 % float; nothing is required of it.
+- **Nobody** owns the Distributor, the token, or can mint, pause or sweep anything else.
+  Tokens sent to the Distributor after launch are stuck; it is not a deposit address.
 
 ## Phase 2
 

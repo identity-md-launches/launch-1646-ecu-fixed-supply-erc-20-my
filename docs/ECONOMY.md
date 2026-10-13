@@ -636,11 +636,14 @@ day one, which is what determines what can move and what cannot.
 | Community | 5 % | `CommunityVesting`: 12-month linear schedule, no cliff | No |
 | Listings | 5 % | Multisig | Held, not liquidity |
 
-The token is created by the launch, which places the pool and the swarm slices itself and
-sends the remaining 75 % to the `Distributor` contract. `distribute()` then splits that
-75 % in one transaction: 50/75 to the Vault, 15/75 to team vesting, 5/75 to community
-vesting and the remainder to listings, so no dust is stranded and no wallet ever holds the
-supply in between. There is no separate LP lock: the pool position is custodied by the
+The `Distributor` is the root of the deployment: its constructor creates the Vault and
+both vesting wallets (and, on the testnet dry run, the token itself, minted entirely to
+the Distributor and split in the same transaction). On mainnet the token is created by
+the launch, which places the pool and the swarm slices itself and sends the remaining
+75 % to the `Distributor` contract (its `TokenDistributor` form). `distribute()` then
+splits that 75 % in one transaction: 50/75 to the Vault, 15/75 to team vesting, 5/75 to
+community vesting and the remainder to listings, so no dust is stranded and no wallet
+ever holds the supply in between. There is no separate LP lock: the pool position is custodied by the
 factory, which replaces the two-year lock earlier drafts of this table specified.
 
 ### How the ledger models it
